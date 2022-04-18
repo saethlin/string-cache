@@ -17,7 +17,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem;
-use std::num::NonZeroU64;
+use std::ptr::NonNull;
 use std::ops;
 use std::slice;
 use std::str;
@@ -78,7 +78,7 @@ const STATIC_SHIFT_BITS: usize = 32;
 #[derive(PartialEq, Eq)]
 // NOTE: Deriving PartialEq requires that a given string must always be interned the same way.
 pub struct Atom<Static> {
-    unsafe_data: NonZeroU64,
+    unsafe_data: NonNull<Entry>,
     phantom: PhantomData<Static>,
 }
 
@@ -93,14 +93,15 @@ impl<Static> Atom<Static> {
         Self {
             unsafe_data: unsafe {
                 // STATIC_TAG ensures this is non-zero
-                NonZeroU64::new_unchecked((STATIC_TAG as u64) | ((n as u64) << STATIC_SHIFT_BITS))
+                let data = (STATIC_TAG as u64) | ((n as u64) << STATIC_SHIFT_BITS);
+                unsafe_data_from_u64(data)
             },
             phantom: PhantomData,
         }
     }
 
     fn tag(&self) -> u8 {
-        (self.unsafe_data.get() & TAG_MASK) as u8
+        (self.unsafe_data.as_ptr() as usize as u64 & TAG_MASK) as u8
     }
 }
 
@@ -108,7 +109,7 @@ impl<Static: StaticAtomSet> Atom<Static> {
     /// Return the internal repersentation. For testing.
     #[doc(hidden)]
     pub fn unsafe_data(&self) -> u64 {
-        self.unsafe_data.get()
+        self.unsafe_data.as_ptr() as usize as u64
     }
 
     /// Return true if this is a static Atom. For testing.
@@ -130,19 +131,19 @@ impl<Static: StaticAtomSet> Atom<Static> {
     }
 
     fn static_index(&self) -> u64 {
-        self.unsafe_data.get() >> STATIC_SHIFT_BITS
+        self.unsafe_data() >> STATIC_SHIFT_BITS
     }
 
     /// Get the hash of the string as it is stored in the set.
     pub fn get_hash(&self) -> u32 {
         match self.tag() {
             DYNAMIC_TAG => {
-                let entry = self.unsafe_data.get() as *const Entry;
+                let entry = self.unsafe_data.as_ptr();
                 unsafe { (*entry).hash }
             }
             STATIC_TAG => Static::get().hashes[self.static_index() as usize],
             INLINE_TAG => {
-                let data = self.unsafe_data.get();
+                let data = self.unsafe_data();
                 // This may or may not be great...
                 ((data >> 32) ^ data) as u32
             }
@@ -184,6 +185,12 @@ impl<Static: StaticAtomSet> Hash for Atom<Static> {
     }
 }
 
+// SAFETY: data must be nonzero
+const unsafe fn unsafe_data_from_u64(data: u64) -> NonNull<Entry> {
+    let ptr = std::ptr::null_mut::<u8>().wrapping_add(data as usize);
+    NonNull::new_unchecked(ptr.cast())
+}
+
 impl<'a, Static: StaticAtomSet> From<Cow<'a, str>> for Atom<Static> {
     fn from(string_to_add: Cow<'a, str>) -> Self {
         Self::try_static_internal(&*string_to_add).unwrap_or_else(|hash| {
@@ -196,17 +203,15 @@ impl<'a, Static: StaticAtomSet> From<Cow<'a, str>> for Atom<Static> {
                 }
                 Atom {
                     // INLINE_TAG ensures this is never zero
-                    unsafe_data: unsafe { NonZeroU64::new_unchecked(data) },
+                    unsafe_data: unsafe { unsafe_data_from_u64(data) },
                     phantom: PhantomData,
                 }
             } else {
                 let ptr: std::ptr::NonNull<Entry> =
                     DYNAMIC_SET.lock().insert(string_to_add, hash.g);
-                let data = ptr.as_ptr() as u64;
-                debug_assert!(0 == data & TAG_MASK);
+                debug_assert!(0 == ptr.as_ptr() as u64 & TAG_MASK);
                 Atom {
-                    // The address of a ptr::NonNull is non-zero
-                    unsafe_data: unsafe { NonZeroU64::new_unchecked(data) },
+                    unsafe_data: ptr,
                     phantom: PhantomData,
                 }
             }
@@ -218,7 +223,7 @@ impl<Static: StaticAtomSet> Clone for Atom<Static> {
     #[inline(always)]
     fn clone(&self) -> Self {
         if self.tag() == DYNAMIC_TAG {
-            let entry = self.unsafe_data.get() as *const Entry;
+            let entry = self.unsafe_data.as_ptr() as *const Entry;
             unsafe { &*entry }.ref_count.fetch_add(1, SeqCst);
         }
         Atom { ..*self }
@@ -229,7 +234,7 @@ impl<Static> Drop for Atom<Static> {
     #[inline]
     fn drop(&mut self) {
         if self.tag() == DYNAMIC_TAG {
-            let entry = self.unsafe_data.get() as *const Entry;
+            let entry = self.unsafe_data.as_ptr() as *const Entry;
             if unsafe { &*entry }.ref_count.fetch_sub(1, SeqCst) == 1 {
                 drop_slow(self)
             }
@@ -239,7 +244,7 @@ impl<Static> Drop for Atom<Static> {
         fn drop_slow<Static>(this: &mut Atom<Static>) {
             DYNAMIC_SET
                 .lock()
-                .remove(this.unsafe_data.get() as *mut Entry);
+                .remove(this.unsafe_data.as_ptr() as *mut Entry);
         }
     }
 }
@@ -252,7 +257,7 @@ impl<Static: StaticAtomSet> ops::Deref for Atom<Static> {
         unsafe {
             match self.tag() {
                 DYNAMIC_TAG => {
-                    let entry = self.unsafe_data.get() as *const Entry;
+                    let entry = self.unsafe_data.as_ptr() as *const Entry;
                     &(*entry).string
                 }
                 INLINE_TAG => {
@@ -363,9 +368,9 @@ impl<Static: StaticAtomSet> Atom<Static> {
 }
 
 #[inline(always)]
-fn inline_atom_slice(x: &NonZeroU64) -> &[u8] {
+fn inline_atom_slice(x: &NonNull<Entry>) -> &[u8] {
     unsafe {
-        let x: *const NonZeroU64 = x;
+        let x: *const NonNull<Entry> = x;
         let mut data = x as *const u8;
         // All except the lowest byte, which is first in little-endian, last in big-endian.
         if cfg!(target_endian = "little") {
